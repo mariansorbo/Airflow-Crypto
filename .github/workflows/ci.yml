@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── 1. Lint & parse DAGs ───────────────────────────────────────────────────
+  lint:
+    name: Lint & parse DAGs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet \
+            apache-airflow==2.9.3 \
+            requests \
+            psycopg2-binary
+
+      - name: Parse DAG — crypto_market_snapshots
+        run: python -c "
+import sys
+sys.path.insert(0, 'dags')
+import importlib.util, traceback
+spec = importlib.util.spec_from_file_location('dag', 'dags/crypto_market_snapshots.py')
+mod  = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+    print('DAG parsed OK')
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+"
+
+      - name: Check Python syntax on all modules
+        run: |
+          python -m py_compile dags/crypto/coins.py
+          python -m py_compile dags/crypto/extract.py
+          python -m py_compile dags/crypto/validate.py
+          python -m py_compile dags/crypto/transform.py
+          python -m py_compile dags/crypto/load.py
+          python -m py_compile dags/crypto/load_raw.py
+          python -m py_compile dags/crypto/extract_from_raw.py
+          python -m py_compile dags/crypto/pipeline_control.py
+          echo "All modules OK"
+
+  # ── 2. Unit tests ──────────────────────────────────────────────────────────
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet pytest requests psycopg2-binary
+
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v
+          else
+            echo "No tests directory yet — skipping"
+          fi
+
+  # ── 3. Validate SQL migrations ─────────────────────────────────────────────
+  migrations:
+    name: Validate SQL migrations
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: airflow
+          POSTGRES_PASSWORD: airflow
+          POSTGRES_DB: crypto_data
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply all migrations
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: crypto_data
+          DB_USER: airflow
+          DB_PASS: airflow
+        run: bash sql/migrate.sh
+
+      - name: Verify schema_migrations table
+        run: |
+          PGPASSWORD=airflow psql -h localhost -U airflow -d crypto_data \
+            -c "SELECT version, filename, applied_at FROM schema_migrations ORDER BY version;"

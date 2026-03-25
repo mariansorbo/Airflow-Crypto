@@ -1,0 +1,15 @@
+# Normalize line endings: store as LF in repo, checkout as native
+* text=auto
+
+# Shell scripts always LF (run inside Linux containers)
+*.sh text eol=lf
+
+# SQL files always LF
+*.sql text eol=lf
+
+# Python always LF
+*.py text eol=lf
+
+# YAML always LF
+*.yml text eol=lf
+*.yaml text eol=lf
