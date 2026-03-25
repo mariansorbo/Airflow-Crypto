@@ -1,5 +1,8 @@
 # Apache Airflow 2.9 - Docker Compose
-# Based on the official Airflow docker-compose.yaml
+# DAGs are synced from GitHub via git-sync sidecar.
+# To change DAGs: push to the 'main' branch of the repo.
+# git-sync pulls every 60 seconds and Airflow rescans automatically.
+
 x-airflow-common: &airflow-common
   image: apache/airflow:2.9.3
   environment: &airflow-common-env
@@ -10,12 +13,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/git/repo/dags
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     AIRFLOW_CONN_CRYPTO_POSTGRES: postgresql://airflow:airflow@postgres:5432/crypto_data
   volumes:
-    - ./dags:/opt/airflow/dags
+    - git-dags:/opt/airflow/git            # DAGs served by git-sync
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./config:/opt/airflow/config
@@ -27,6 +31,8 @@ x-airflow-common: &airflow-common
       condition: service_healthy
 
 services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
   postgres:
     image: postgres:15
     environment:
@@ -59,6 +65,36 @@ services:
       start_period: 30s
     restart: always
 
+  # ── git-sync — clones and keeps the repo up to date ─────────────────────────
+  # Writes to the git-dags volume under /dags.
+  # Creates:  /dags/repo  →  symlink to the current worktree
+  # Airflow reads from:  /opt/airflow/git/repo/dags
+  #
+  # To deploy a change: git push origin main
+  # Airflow will pick it up within ~90 seconds (60s sync + 30s DAG rescan).
+
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    environment:
+      GITSYNC_REPO: https://github.com/mariansorbo/Airflow-Crypto.git
+      GITSYNC_BRANCH: main
+      GITSYNC_ROOT: /dags
+      GITSYNC_LINK: repo
+      GITSYNC_PERIOD: 60s
+      GITSYNC_DEPTH: 1       # shallow clone — only latest commit
+    volumes:
+      - git-dags:/dags
+    user: "0:0"               # root — needed to write to the Docker volume
+    healthcheck:
+      test: ["CMD-SHELL", "test -L /dags/repo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: always
+
+  # ── Airflow services ─────────────────────────────────────────────────────────
+
   airflow-webserver:
     <<: *airflow-common
     command: webserver
@@ -75,6 +111,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      git-sync:
+        condition: service_healthy
 
   airflow-scheduler:
     <<: *airflow-common
@@ -90,6 +128,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      git-sync:
+        condition: service_healthy
 
   airflow-worker:
     <<: *airflow-common
@@ -110,6 +150,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      git-sync:
+        condition: service_healthy
 
   airflow-triggerer:
     <<: *airflow-common
@@ -125,6 +167,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      git-sync:
+        condition: service_healthy
 
   airflow-init:
     <<: *airflow-common
@@ -132,8 +176,8 @@ services:
     command:
       - -c
       - |
-        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/config
-        chown -R "${AIRFLOW_UID:-50000}:0" /sources/{logs,dags,plugins,config}
+        mkdir -p /sources/logs /sources/plugins /sources/config
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/logs /sources/plugins /sources/config
         exec /entrypoint airflow version
     environment:
       <<: *airflow-common-env
@@ -179,3 +223,4 @@ services:
 
 volumes:
   postgres-db-volume:
+  git-dags:
