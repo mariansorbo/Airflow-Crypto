@@ -13,10 +13,10 @@ Schedule: None (manual only).
 """
 
 import logging
+from datetime import datetime, timezone
 
-from airflow.decorators import dag
+from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 
 from crypto import backfill_utils
 
@@ -54,15 +54,15 @@ def _run_backfill(**ctx):
 # DAG definition
 # ---------------------------------------------------------------------------
 
-with dag(
+with DAG(
     dag_id="crypto_backfill_manager",
     description="Detects missing pipeline slots and triggers backfill runs",
-    schedule_interval=None,      # manual only
-    start_date=days_ago(1),
+    schedule=None,
+    start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     tags=["crypto", "backfill", "maintenance"],
-) as dag_obj:
+) as dag:
 
     t_detect = PythonOperator(
         task_id="detect_gaps",
