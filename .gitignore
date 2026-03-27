@@ -49,3 +49,6 @@ Thumbs.db
 *.log
 *.tmp
 explicaciones/
+
+# Claude Code internal
+.claude/
