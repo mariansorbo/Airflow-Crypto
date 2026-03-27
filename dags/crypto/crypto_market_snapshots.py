@@ -60,7 +60,6 @@ Warning — worker slot usage:
 """
 
 import logging
-import time
 from datetime import datetime, timezone, UTC
 
 from airflow import DAG
@@ -361,8 +360,8 @@ with DAG(
     # Task 10 — should_self_trigger
     #
     # ShortCircuit: returns True only for non-backfill runs.
-    # If this is a backfill run, the downstream wait + trigger tasks are
-    # skipped so the backfill chain doesn't re-launch normal production runs.
+    # If this is a backfill run, the downstream trigger task is skipped so
+    # the backfill chain doesn't re-launch normal production runs.
     # -----------------------------------------------------------------------
     def _should_self_trigger(**ctx):
         run_type = ctx["ti"].xcom_pull(task_ids="get_coin_universe", key="run_type")
@@ -370,27 +369,6 @@ with DAG(
             log.info("Backfill run — skipping self-trigger")
             return False
         return True
-
-    # -----------------------------------------------------------------------
-    # Task 11 — wait_for_next_slot
-    #
-    # Sleeps until 30 minutes have elapsed since snapshot_ts, so successive
-    # runs maintain a ~30-min cadence even when the pipeline finishes quickly.
-    # Note: occupies a Celery worker slot for the duration of the sleep.
-    # -----------------------------------------------------------------------
-    _SLOT_INTERVAL_SEC = 30 * 60   # 30 minutes
-
-    def _wait_for_next_slot(**ctx):
-        snapshot_ts_str = ctx["ti"].xcom_pull(task_ids="get_coin_universe", key="snapshot_ts")
-        snapshot_ts     = datetime.fromisoformat(snapshot_ts_str)
-        elapsed         = (datetime.now(UTC) - snapshot_ts).total_seconds()
-        wait_seconds    = max(0.0, _SLOT_INTERVAL_SEC - elapsed)
-
-        if wait_seconds > 0:
-            log.info("Waiting %.0f s until next 30-min slot (elapsed: %.0f s)", wait_seconds, elapsed)
-            time.sleep(wait_seconds)
-        else:
-            log.info("No wait needed — pipeline took longer than %d s", _SLOT_INTERVAL_SEC)
 
     # -----------------------------------------------------------------------
     # Instantiate operators
@@ -409,7 +387,6 @@ with DAG(
         task_id="should_self_trigger",
         python_callable=_should_self_trigger,
     )
-    t_wait    = PythonOperator(task_id="wait_for_next_slot", python_callable=_wait_for_next_slot)
     t_trigger = TriggerDagRunOperator(
         task_id="trigger_next_run",
         trigger_dag_id="crypto_market_snapshots",
@@ -430,6 +407,5 @@ with DAG(
         >> t_summary
         >> t_finalize
         >> t_should_trigger
-        >> t_wait
         >> t_trigger
     )
