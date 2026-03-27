@@ -72,11 +72,18 @@ def fetch_market_snapshot(coin_ids: List[str]) -> Dict[str, dict]:
 # Coin metadata + developer metrics  — one call per coin
 # ---------------------------------------------------------------------------
 
+_RETRY_WAIT_429 = 65   # seconds to wait after a 429 before retrying
+_MAX_RETRIES    = 2    # number of retry attempts on 429
+
+
 def fetch_coin_detail(coin_id: str) -> Optional[dict]:
     """
     GET /coins/{id}
     Returns full coin detail (metadata + developer_data).
-    Returns None on non-fatal errors (404, 429 after logging).
+
+    On 429 Too Many Requests: waits _RETRY_WAIT_429 seconds and retries up to
+    _MAX_RETRIES times before giving up and returning None.
+    On any other HTTP error (e.g. 404): returns None immediately.
     """
     params = {
         "localization": "false",
@@ -86,20 +93,38 @@ def fetch_coin_detail(coin_id: str) -> Optional[dict]:
         "developer_data": "true",
         "sparkline": "false",
     }
-    try:
-        return _get(f"{COINGECKO_BASE}/coins/{coin_id}", params)
-    except requests.HTTPError as exc:
-        log.warning("HTTP error fetching detail for %s: %s", coin_id, exc)
-        return None
-    except requests.RequestException as exc:
-        log.warning("Request error fetching detail for %s: %s", coin_id, exc)
-        return None
+    url = f"{COINGECKO_BASE}/coins/{coin_id}"
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return _get(url, params)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 429:
+                if attempt < _MAX_RETRIES:
+                    log.warning(
+                        "429 for %s (attempt %d/%d) — waiting %ds before retry",
+                        coin_id, attempt, _MAX_RETRIES, _RETRY_WAIT_429,
+                    )
+                    time.sleep(_RETRY_WAIT_429)
+                else:
+                    log.warning("429 for %s — max retries reached, skipping", coin_id)
+                    return None
+            else:
+                log.warning("HTTP error fetching detail for %s: %s", coin_id, exc)
+                return None
+        except requests.RequestException as exc:
+            log.warning("Request error fetching detail for %s: %s", coin_id, exc)
+            return None
+
+    return None
 
 
-def fetch_all_details(coin_ids: List[str], delay: float = 2.2) -> Dict[str, Optional[dict]]:
+def fetch_all_details(coin_ids: List[str], delay: float = 3.0) -> Dict[str, Optional[dict]]:
     """
-    Fetch /coins/{id} for every coin with inter-request delay to stay under
-    the free-tier rate limit (~30 req/min → 2 s gap is safe).
+    Fetch /coins/{id} for every coin with inter-request delay.
+
+    Delay raised to 3.0s (was 2.2s) to reduce 429 frequency.
+    Each individual call already handles 429 with retry + backoff internally.
     """
     results: Dict[str, Optional[dict]] = {}
     total = len(coin_ids)

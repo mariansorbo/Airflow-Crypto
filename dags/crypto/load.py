@@ -80,10 +80,16 @@ def insert_snapshots(conn, snapshots: List[Dict]) -> None:
     sql = """
         INSERT INTO coin_market_snapshots
             (snapshot_ts, coin_id, price_usd, market_cap_usd, volume_24h_usd,
-             circulating_supply, total_supply, max_supply, market_cap_rank, run_type)
+             circulating_supply, total_supply, max_supply, market_cap_rank,
+             run_type, origin_updated_time)
         VALUES %s
         ON CONFLICT (snapshot_ts, coin_id) DO NOTHING
     """
+    # Nota: el trigger trg_check_origin_updated_time se dispara BEFORE INSERT.
+    # Si origin_updated_time no es más nuevo que el último registrado para ese
+    # coin_id, el trigger cancela el insert y lo redirige a
+    # coin_market_snapshots_not_updated. El ON CONFLICT nunca llega a evaluarse
+    # en ese caso porque el insert ya fue cancelado por el trigger.
     values = [
         (
             s["snapshot_ts"],
@@ -96,6 +102,7 @@ def insert_snapshots(conn, snapshots: List[Dict]) -> None:
             s["max_supply"],
             s["market_cap_rank"],
             s.get("run_type", "scheduled"),
+            s.get("origin_updated_time"),
         )
         for s in snapshots
     ]

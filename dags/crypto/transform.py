@@ -47,18 +47,25 @@ def _safe_int(value: Any) -> Optional[int]:
 def transform_snapshot(coin_id: str, raw: dict, snapshot_ts: Any, run_type: str = "scheduled") -> Dict:
     """
     Maps a /coins/markets entry to a coin_market_snapshots row.
+
+    origin_updated_time: timestamp que devuelve CoinGecko en el campo last_updated,
+    indica cuándo fue la última vez que la fuente actualizó el precio de ese coin.
+    El trigger trg_check_origin_updated_time compara este valor contra el último
+    registrado — si no es más nuevo, el insert se cancela y se redirige a
+    coin_market_snapshots_not_updated.
     """
     return {
-        "snapshot_ts":        _dt(snapshot_ts),
-        "coin_id":            coin_id,
-        "price_usd":          _safe_float(raw.get("current_price")),
-        "market_cap_usd":     _safe_float(raw.get("market_cap")),
-        "volume_24h_usd":     _safe_float(raw.get("total_volume")),
-        "circulating_supply": _safe_float(raw.get("circulating_supply")),
-        "total_supply":       _safe_float(raw.get("total_supply")),
-        "max_supply":         _safe_float(raw.get("max_supply")),
-        "market_cap_rank":    _safe_int(raw.get("market_cap_rank")),
-        "run_type":           run_type,
+        "snapshot_ts":          _dt(snapshot_ts),
+        "coin_id":              coin_id,
+        "price_usd":            _safe_float(raw.get("current_price")),
+        "market_cap_usd":       _safe_float(raw.get("market_cap")),
+        "volume_24h_usd":       _safe_float(raw.get("total_volume")),
+        "circulating_supply":   _safe_float(raw.get("circulating_supply")),
+        "total_supply":         _safe_float(raw.get("total_supply")),
+        "max_supply":           _safe_float(raw.get("max_supply")),
+        "market_cap_rank":      _safe_int(raw.get("market_cap_rank")),
+        "run_type":             run_type,
+        "origin_updated_time":  _dt(raw.get("last_updated")),
     }
 
 
