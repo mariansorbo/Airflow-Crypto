@@ -1,6 +1,6 @@
 """
 DAG: crypto_market_snapshots
-Schedule: every 30 minutes
+Schedule: None — self-triggering (each run schedules the next one)
 Source: CoinGecko GET /coins/markets (1 API call for all 50 coins)
 Target: PostgreSQL — coin_market_snapshots, coin_daily_summary, raw.coin_market_responses
 
@@ -31,16 +31,41 @@ Task graph (linear — single API call, no parallel branches needed):
           │
           ▼
     finalize_run                  ← close orchestration.pipeline_runs record
+          │
+          ▼
+    should_self_trigger           ← ShortCircuit: skips next two tasks if backfill run
+          │
+          ▼
+    wait_for_next_slot            ← sleeps until 30 min have elapsed since snapshot_ts
+          │
+          ▼
+    trigger_next_run              ← TriggerDagRunOperator → fires a new run of this DAG
 
 Note: coins_dim and coin_dev_metrics are updated by crypto_daily_pull_metadata DAG,
 not here. Stub dim rows are auto-inserted if a coin has no metadata yet.
+
+Self-trigger cadence:
+    Each run waits until 30 minutes have elapsed since its own snapshot_ts, then
+    triggers the next run. This means the gap between runs is always >= 30 min,
+    regardless of how long the pipeline itself takes.
+    Backfill runs (run_type == "backfill") skip the wait and do NOT self-trigger,
+    so a backfill chain does not accidentally re-launch normal production runs.
+
+Warning — worker slot usage:
+    The wait_for_next_slot task holds a Celery worker slot for the duration of the
+    sleep (up to ~30 min). This is acceptable for a single-worker setup but wastes
+    resources if the worker pool is shared. The alternative is to keep the cron
+    schedule (*/30 * * * *) and rely on max_active_runs=1 — Airflow handles the
+    pacing without occupying a worker.
 """
 
 import logging
+import time
 from datetime import datetime, timezone, UTC
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from crypto.coins import COIN_UNIVERSE
 from crypto.market_snapshots import extract, validate, transform, load, load_raw, extract_from_raw
@@ -67,8 +92,8 @@ def _on_failure_callback(context):
 
 with DAG(
     dag_id="crypto_market_snapshots",
-    description="Captures crypto market snapshots every 30 min — 1 API call for all 50 coins",
-    schedule="*/30 * * * *",
+    description="Captures crypto market snapshots every ~30 min — self-triggering, 1 API call for all 50 coins",
+    schedule=None,
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
@@ -333,6 +358,41 @@ with DAG(
         return f"Run {run_id} finalized"
 
     # -----------------------------------------------------------------------
+    # Task 10 — should_self_trigger
+    #
+    # ShortCircuit: returns True only for non-backfill runs.
+    # If this is a backfill run, the downstream wait + trigger tasks are
+    # skipped so the backfill chain doesn't re-launch normal production runs.
+    # -----------------------------------------------------------------------
+    def _should_self_trigger(**ctx):
+        run_type = ctx["ti"].xcom_pull(task_ids="get_coin_universe", key="run_type")
+        if run_type == "backfill":
+            log.info("Backfill run — skipping self-trigger")
+            return False
+        return True
+
+    # -----------------------------------------------------------------------
+    # Task 11 — wait_for_next_slot
+    #
+    # Sleeps until 30 minutes have elapsed since snapshot_ts, so successive
+    # runs maintain a ~30-min cadence even when the pipeline finishes quickly.
+    # Note: occupies a Celery worker slot for the duration of the sleep.
+    # -----------------------------------------------------------------------
+    _SLOT_INTERVAL_SEC = 30 * 60   # 30 minutes
+
+    def _wait_for_next_slot(**ctx):
+        snapshot_ts_str = ctx["ti"].xcom_pull(task_ids="get_coin_universe", key="snapshot_ts")
+        snapshot_ts     = datetime.fromisoformat(snapshot_ts_str)
+        elapsed         = (datetime.now(UTC) - snapshot_ts).total_seconds()
+        wait_seconds    = max(0.0, _SLOT_INTERVAL_SEC - elapsed)
+
+        if wait_seconds > 0:
+            log.info("Waiting %.0f s until next 30-min slot (elapsed: %.0f s)", wait_seconds, elapsed)
+            time.sleep(wait_seconds)
+        else:
+            log.info("No wait needed — pipeline took longer than %d s", _SLOT_INTERVAL_SEC)
+
+    # -----------------------------------------------------------------------
     # Instantiate operators
     # -----------------------------------------------------------------------
     t_universe    = PythonOperator(task_id="get_coin_universe",        python_callable=_get_coin_universe)
@@ -345,7 +405,31 @@ with DAG(
     t_summary     = PythonOperator(task_id="build_daily_summary",      python_callable=_build_daily_summary)
     t_finalize    = PythonOperator(task_id="finalize_run",             python_callable=_finalize_run)
 
+    t_should_trigger = ShortCircuitOperator(
+        task_id="should_self_trigger",
+        python_callable=_should_self_trigger,
+    )
+    t_wait    = PythonOperator(task_id="wait_for_next_slot", python_callable=_wait_for_next_slot)
+    t_trigger = TriggerDagRunOperator(
+        task_id="trigger_next_run",
+        trigger_dag_id="crypto_market_snapshots",
+        wait_for_completion=False,   # fire-and-forget — don't block the current run
+    )
+
     # -----------------------------------------------------------------------
     # Task dependencies — fully linear (single API call, no parallel branches)
     # -----------------------------------------------------------------------
-    t_universe >> t_snapshot >> t_load_raw >> t_extract_raw >> t_validate >> t_transform >> t_load >> t_summary >> t_finalize
+    (
+        t_universe
+        >> t_snapshot
+        >> t_load_raw
+        >> t_extract_raw
+        >> t_validate
+        >> t_transform
+        >> t_load
+        >> t_summary
+        >> t_finalize
+        >> t_should_trigger
+        >> t_wait
+        >> t_trigger
+    )
