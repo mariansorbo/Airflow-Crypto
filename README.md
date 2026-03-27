@@ -1,6 +1,6 @@
 # Crypto Market Snapshots — Airflow Pipeline
 
-Pipeline de ingeniería de datos que captura métricas de mercado de 50 criptomonedas cada 30 minutos desde la API pública de CoinGecko, las persiste en una capa raw, las valida, transforma y carga en PostgreSQL.
+Pipeline de ingeniería de datos que captura métricas de mercado de 50 criptomonedas cada 30 minutos desde la API pública de CoinGecko. Separa la captura de precios (cada 30 min, 1 llamada a la API) de la captura de metadata y métricas de desarrollo (1 vez por día, 50 llamadas).
 
 ---
 
@@ -16,123 +16,123 @@ Pipeline de ingeniería de datos que captura métricas de mercado de 50 criptomo
 
 ---
 
-## Arquitectura general
+## DAGs
+
+### `crypto_market_snapshots` — cada 30 minutos
+
+Captura precio, market cap, volumen y supply para las 50 monedas con **una sola llamada** a `/coins/markets`.
 
 ```
-CoinGecko API
+get_coin_universe
       │
       ▼
-┌─────────────────────────────────────────────────────┐
-│                   Airflow DAG                       │
-│  (crypto_market_snapshots — cada 30 minutos)        │
-│                                                     │
-│  get_coin_universe                                  │
-│       ├──────────────────────┐                      │
-│       ▼                      ▼                      │
-│  extract_current_snapshot   extract_coin_metadata   │
-│       │                      │                      │
-│       │                      ▼                      │
-│       │              extract_dev_metrics            │
-│       │                      │                      │
-│       └──────────┬───────────┘                      │
-│                  ▼                                  │
-│           load_raw_data        ──► raw.*            │
-│                  │                                  │
-│                  ▼                                  │
-│          extract_from_raw      ◄── raw.*            │
-│                  │                                  │
-│                  ▼                                  │
-│          validate_raw_data                          │
-│                  │                                  │
-│                  ▼                                  │
-│       transform_and_normalize                       │
-│                  │                                  │
-│                  ▼                                  │
-│          load_to_postgres      ──► public.*         │
-│                  │                                  │
-│                  ▼                                  │
-│        build_daily_summary     ──► public.*         │
-│                  │                                  │
-│                  ▼                                  │
-│            finalize_run        ──► orchestration.*  │
-└─────────────────────────────────────────────────────┘
+extract_current_snapshot   ← GET /coins/markets (1 call, 50 coins)
+      │
+      ▼
+load_raw_data              ── raw.coin_market_responses
+      │
+      ▼
+extract_from_raw           ← lee desde raw.*
+      │
+      ▼
+validate_raw_data          ← precio > 0, market_cap ≥ 0, id presente
+      │
+      ▼
+transform_and_normalize    ← build snapshot rows + origin_updated_time
+      │
+      ▼
+load_to_postgres           ── coin_market_snapshots (trigger dedup activo)
+      │
+      ▼
+build_daily_summary        ── coin_daily_summary (OHLCV)
+      │
+      ▼
+finalize_run               ── orchestration.pipeline_runs
 ```
+
+### `crypto_daily_pull_metadata` — 06:00 UTC una vez por día
+
+Captura metadata (nombre, categorías, links) y métricas de desarrollo (GitHub stars/forks) para las 50 monedas. Sin capa raw — va directo a tablas limpias.
+
+```
+get_coin_universe
+      │
+      ▼
+extract_metadata    ← GET /coins/{id} × 50 (3s delay, retry en 429)
+      │
+      ▼
+validate_metadata   ← id presente, name presente, response no nulo
+      │
+      ▼
+transform_metadata  ← build coins_dim rows + coin_dev_metrics rows
+      │
+      ▼
+load_metadata       ── coins_dim (UPSERT), coin_dev_metrics (INSERT)
+```
+
+### `crypto_backfill_manager` — manual
+
+Detecta slots de 30 min sin run exitoso y los encola para reejecutar.
+
+---
+
+## Quota de API CoinGecko (plan Demo gratuito: 10.000 calls/mes)
+
+| Pipeline | Calls por mes | Dentro del límite |
+|---|---|---|
+| market snapshots (1 call × 48 runs/día × 30 días) | 1.440 | ✅ |
+| daily pull (50 calls × 1 run/día × 30 días) | 1.500 | ✅ |
+| **Total** | **~2.940** | ✅ (vs 73.440 antes del refactor) |
 
 ---
 
 ## Schemas de la base de datos
 
-La base de datos se llama `crypto_data` y tiene tres schemas con responsabilidades bien separadas.
+La base de datos se llama `crypto_data` y tiene tres schemas.
 
 ### `public` — capa limpia
 
-| Tabla | Descripción |
-|---|---|
-| `coins_dim` | Dimensión de monedas: nombre, símbolo, categorías, links. Se actualiza en cada run. |
-| `coin_market_snapshots` | Fact table principal. Un registro por (timestamp, moneda): precio, market cap, volumen, supply. |
-| `coin_dev_metrics` | Métricas de actividad de desarrollo: stars y forks de GitHub, datos crudos completos en JSONB. |
-| `coin_raw_responses` | Respaldo de payloads JSON de la API antes de ser procesados (tabla legacy, reemplazada por `raw.*`). |
-| `coin_daily_summary` | Resumen OHLCV diario por moneda. Se recalcula con UPSERT en cada corrida. |
+| Tabla | Actualizada por | Descripción |
+|---|---|---|
+| `coins_dim` | daily pull | Dimensión de monedas: nombre, símbolo, categorías, links. UPSERT en cada pull diario. |
+| `coin_market_snapshots` | market snapshots | Fact table. Un registro por (snapshot_ts, coin_id): precio, market cap, volumen, supply, rank. |
+| `coin_dev_metrics` | daily pull | Métricas de desarrollo: GitHub stars, forks, JSON completo. Un registro por (snapshot_ts, coin_id). |
+| `coin_daily_summary` | market snapshots | Resumen OHLCV diario. Se recalcula con UPSERT en cada corrida de 30 min. |
+| `coin_market_snapshots_not_updated` | trigger BD | Registra inserts rechazados por `trg_check_origin_updated_time` — datos cuyo `origin_updated_time` no es más nuevo que el último registrado. Sirve como queue para fuentes alternativas. |
 
-### `raw` — capa raw
+### `raw` — capa raw (solo market data)
 
-Guarda el JSON original de cada endpoint de CoinGecko, sin transformar. Clave de deduplicación: `(run_id, coin_id, source_endpoint)`.
+| Tabla | Endpoint | Descripción |
+|---|---|---|
+| `raw.coin_market_responses` | `/coins/markets` | JSON original de cada run de 30 min. 1 fila por (run_id, coin_id). Incluye `payload_hash` MD5 para detección de cambios. |
 
-| Tabla | Endpoint origen |
-|---|---|
-| `raw.coin_market_responses` | `/coins/markets` |
-| `raw.coin_metadata_responses` | `/coins/{id}` |
-| `raw.coin_dev_responses` | `/coins/{id}` → bloque `developer_data` |
-
-Cada fila incluye `payload_hash` (MD5 del JSON con keys ordenadas) para detectar cambios entre corridas.
-
-### `public` — tablas adicionales de calidad
-
-| Tabla | Descripción |
-|---|---|
-| `coin_market_snapshots_not_updated` | Registra los casos donde CoinGecko devolvió un dato con el mismo `origin_updated_time` que el último snapshot conocido. El trigger `trg_check_origin_updated_time` lo redirige acá en lugar de insertarlo como duplicado. Puede usarse para triggerear llamadas a fuentes de datos alternativas. |
+> La metadata no tiene capa raw — va directo a `coins_dim` y `coin_dev_metrics`.
 
 ### `orchestration` — auditoría
 
 | Tabla | Descripción |
 |---|---|
-| `orchestration.pipeline_runs` | Una fila por DAG run. Registra status, conteos de filas procesadas y errores. |
-| `orchestration.backfill_queue` | Queue de slots faltantes detectados por el DAG de backfill. Cada fila es un intervalo de 30 min que no tuvo run exitoso. |
+| `orchestration.pipeline_runs` | Una fila por DAG run de market snapshots. Registra status, conteos y errores. |
+| `orchestration.backfill_queue` | Queue de slots faltantes detectados por el backfill manager. |
 
 **Ciclo de vida de un run:**
-
 ```
-start_run()  →  status = 'running'   (tarea get_coin_universe)
-fail_run()   →  status = 'failed'    (on_failure_callback, si falla cualquier tarea)
-finish_run() →  status = 'success'   (tarea finalize_run, si 50/50 monedas ok)
-              → status = 'partial'   (tarea finalize_run, si menos de 50 monedas ok)
+start_run()  →  status = 'running'   (get_coin_universe)
+fail_run()   →  status = 'failed'    (on_failure_callback)
+finish_run() →  status = 'success'   (finalize_run, si 50/50 coins ok)
+              → status = 'partial'   (finalize_run, si menos de 50 coins ok)
 ```
 
 ---
 
-## Detalle de las tareas del DAG
+## Control de datos duplicados — `origin_updated_time`
 
-| # | Tarea | Qué hace |
-|---|---|---|
-| 1 | `get_coin_universe` | Lee la lista fija de 50 coins. Captura el timestamp real (`datetime.now(UTC)`). Registra el inicio del run en `pipeline_runs`. |
-| 2 | `extract_current_snapshot` | Llama a `/coins/markets` — un solo request para los 50 coins. Devuelve precio, market cap, volumen, supply y rank. |
-| 3 | `extract_coin_metadata` | Llama a `/coins/{id}` para cada moneda (50 requests con delay de 3s). Si recibe 429, espera 65s y reintenta hasta 2 veces antes de descartar la moneda. |
-| 4 | `extract_dev_metrics` | Extrae el bloque `developer_data` del XCom de `extract_coin_metadata`. No hace requests adicionales. |
-| 5 | `load_raw_data` | Persiste los tres payloads crudos en `raw.*` con `ON CONFLICT DO NOTHING`. Calcula `payload_hash`. |
-| 6 | `extract_from_raw` | Recupera los datos del run actual desde `raw.*`. Desacopla la extracción de la transformación. |
-| 7 | `validate_raw_data` | Valida cada snapshot (precio > 0, market cap ≥ 0, id presente). Las monedas que no pasan se descartan con warning. |
-| 8 | `transform_and_normalize` | Convierte los dicts crudos en filas estructuradas para cada tabla destino. Agrega `run_type` y `snapshot_ts`. |
-| 9 | `load_to_postgres` | Hace UPSERT de `coins_dim` y bulk insert de snapshots, dev metrics y raw responses. El trigger `trg_check_origin_updated_time` intercepta cada insert en `coin_market_snapshots`: si el dato de CoinGecko no es más nuevo que el último registrado para esa moneda, lo redirige a `coin_market_snapshots_not_updated` en lugar de insertarlo. |
-| 10 | `build_daily_summary` | Recalcula el resumen OHLCV del día actual con un CTE + `ON CONFLICT DO UPDATE`. |
-| 11 | `finalize_run` | Cierra el registro en `pipeline_runs` con los conteos finales y el status correcto. |
+`coin_market_snapshots` tiene una columna `origin_updated_time` con el timestamp `last_updated` de CoinGecko — cuándo fue actualizado el precio en la fuente, no cuándo lo capturamos.
 
----
+El trigger `trg_check_origin_updated_time` (BEFORE INSERT) compara ese valor contra el último registrado por coin:
 
-## Universo de monedas
-
-50 criptomonedas fijas definidas en `dags/crypto/coins.py`. Criterio: no-stablecoins, liquidez relevante, IDs de CoinGecko.
-
-Incluye: Bitcoin, Ethereum, Solana, BNB, XRP, Cardano, Dogecoin, Chainlink, Avalanche, Polkadot, Uniswap, Aave, Maker, y otros 37 más.
+- `origin_updated_time` **mayor** al anterior → insert normal ✅
+- `origin_updated_time` **igual o menor** → insert cancelado, fila redirigida a `coin_market_snapshots_not_updated` ⚠️
 
 ---
 
@@ -141,34 +141,40 @@ Incluye: Bitcoin, Ethereum, Solana, BNB, XRP, Cardano, Dogecoin, Chainlink, Aval
 ```
 Airflow/
 ├── dags/
-│   ├── crypto_market_snapshots.py   # DAG principal
 │   └── crypto/
-│       ├── coins.py                 # lista de 50 monedas
-│       ├── extract.py               # llamadas a la API de CoinGecko
-│       ├── validate.py              # validación de payloads crudos
-│       ├── transform.py             # transformación a filas estructuradas
-│       ├── load.py                  # escritura en tablas públicas
-│       ├── load_raw.py              # escritura en raw.*
-│       ├── extract_from_raw.py      # lectura desde raw.*
-│       └── pipeline_control.py      # auditoría en orchestration.*
-├── dags/
-│   ├── crypto_backfill_manager.py   # DAG de backfill: detecta gaps y los encola
-│   └── crypto/
-│       └── backfill_utils.py        # detección de gaps + trigger de runs vía API REST
+│       ├── coins.py                        # lista estática de 50 monedas
+│       ├── pipeline_control.py             # auditoría en orchestration.*
+│       ├── backfill_utils.py               # detección de gaps + trigger REST API
+│       ├── crypto_market_snapshots.py      # DAG cada 30 min
+│       ├── crypto_daily_pull_metadata.py   # DAG diario 06:00 UTC
+│       ├── crypto_backfill_manager.py      # DAG backfill (manual)
+│       ├── market_snapshots/               # módulos del pipeline de 30 min
+│       │   ├── extract.py                  # fetch_market_snapshot (/coins/markets)
+│       │   ├── validate.py                 # validate_snapshot
+│       │   ├── transform.py                # build_snapshots
+│       │   ├── load.py                     # insert_snapshots + build_daily_summary
+│       │   ├── load_raw.py                 # save raw.coin_market_responses
+│       │   └── extract_from_raw.py         # get_latest_batch (market only)
+│       └── daily_pull_metadata/            # módulos del pipeline diario
+│           ├── extract.py                  # fetch_all_details (/coins/{id} × 50)
+│           ├── validate.py                 # validate_metadata
+│           ├── transform.py                # build_dims + build_dev_metrics
+│           └── load.py                     # upsert_coins_dim + insert_dev_metrics
 ├── scripts/
-│   └── test_historical_polygon.py   # exploración de datos históricos de CoinGecko
+│   └── test_historical_polygon.py          # exploración de datos históricos
 ├── sql/
-│   ├── init_crypto.sh               # setup inicial (solo primer arranque)
-│   ├── migrate.sh                   # runner de migraciones
+│   ├── init_crypto.sh                      # setup inicial (solo primer arranque)
+│   ├── migrate.sh                          # runner de migraciones
 │   └── migrations/
 │       ├── V1__initial_schema.sql
 │       ├── V2__add_run_type_and_orchestration.sql
 │       ├── V3__add_backfill_queue.sql
-│       └── V4__origin_updated_time_trigger.sql
+│       ├── V4__origin_updated_time_trigger.sql
+│       └── V5__drop_raw_metadata_dev_tables.sql
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                   # CI: parse DAG, syntax, migraciones
-├── dashboard.py                     # dashboard Tkinter local
+│       └── ci.yml                          # CI: parse DAGs, syntax, migraciones
+├── dashboard.py                            # dashboard Tkinter local
 ├── docker-compose.yml
 ├── .env.example
 └── .gitattributes
@@ -204,14 +210,11 @@ Los datos persisten en los volúmenes de Docker.
 
 ## Migraciones de schema
 
-Cada cambio de estructura de la base de datos vive en `sql/migrations/` como un archivo versionado `V{n}__{descripcion}.sql`.
+Cada cambio de estructura vive en `sql/migrations/` como un archivo versionado `V{n}__{descripcion}.sql`.
 
 ```bash
-# Ver qué migraciones están pendientes
-bash sql/migrate.sh --dry-run
-
-# Aplicar migraciones pendientes
-bash sql/migrate.sh
+bash sql/migrate.sh --dry-run   # ver qué migraciones están pendientes
+bash sql/migrate.sh             # aplicar migraciones pendientes
 ```
 
 Las versiones aplicadas se registran en la tabla `schema_migrations` dentro de `crypto_data`.
@@ -220,11 +223,11 @@ Las versiones aplicadas se registran en la tabla `schema_migrations` dentro de `
 
 ## CI (GitHub Actions)
 
-Ante cada push a `main` o `feature/**` se corren tres jobs:
+Ante cada push a `main` o `feature/**`:
 
 | Job | Qué verifica |
 |---|---|
-| `lint` | Parsea el DAG completo y verifica sintaxis de todos los módulos |
+| `lint` | Parsea los DAGs y verifica sintaxis de todos los módulos |
 | `test` | Corre `pytest tests/` (cuando exista el directorio) |
 | `migrations` | Levanta un Postgres temporal y aplica todas las migraciones desde cero |
 
@@ -232,27 +235,12 @@ Ante cada push a `main` o `feature/**` se corren tres jobs:
 
 ## Backfill manager
 
-Un segundo DAG (`crypto_backfill_manager`) se encarga de detectar y completar slots faltantes.
+El DAG `crypto_backfill_manager` detecta slots de 30 min sin run exitoso y los triggerlea.
 
-**Cómo funciona:**
+1. `detect_gaps` — compara slots esperados contra `pipeline_runs`. Los faltantes van a `orchestration.backfill_queue` con estado `pending`.
+2. `run_backfill` — lee los `pending`, dispara el DAG principal vía la API REST de Airflow pasando `backfill_slot` en el `conf`, marca cada uno como `triggered`.
 
-1. `detect_gaps` — compara los slots esperados de 30 min contra `pipeline_runs`. Los faltantes se insertan en `orchestration.backfill_queue` con estado `pending`.
-2. `trigger_backfill_runs` — lee los `pending`, dispara el DAG principal vía la API REST de Airflow pasando el `backfill_slot` en el `conf`, y los marca como `triggered`.
-
-**Limitación conocida:** CoinGecko en plan gratuito devuelve granularidad horaria para datos históricos. Dos slots del mismo slot horario (ej. `10:00` y `10:30`) van a traer el mismo precio. Esto queda registrado y es visible en `coin_market_snapshots_not_updated`.
-
----
-
-## Control de datos duplicados — `origin_updated_time`
-
-`coin_market_snapshots` tiene una columna `origin_updated_time` que registra el timestamp `last_updated` que devuelve CoinGecko para cada precio — es decir, cuándo fue actualizado el dato en la fuente, no cuándo fue capturado por el pipeline.
-
-Un trigger `BEFORE INSERT` (`trg_check_origin_updated_time`) compara este valor contra el último registrado para cada moneda:
-
-- Si `origin_updated_time` es **mayor** al anterior → insert normal ✅
-- Si es **igual o menor** (dato sin actualizar) → insert cancelado, se registra en `coin_market_snapshots_not_updated` ⚠️
-
-La tabla `coin_market_snapshots_not_updated` actúa como queue para identificar monedas con baja frecuencia de actualización en CoinGecko y potencialmente consultar fuentes alternativas.
+**Limitación:** CoinGecko en plan gratuito devuelve granularidad horaria para datos históricos. Dos slots del mismo slot horario (ej. `10:00` y `10:30`) van a traer el mismo precio → quedan registrados en `coin_market_snapshots_not_updated`.
 
 ---
 
@@ -281,7 +269,7 @@ WHERE coin_id = 'bitcoin'
 ORDER BY date DESC
 LIMIT 7;
 
--- Monedas con datos sin actualizar (mismo origin_updated_time que el run anterior)
+-- Monedas con datos sin actualizar (trigger dedup)
 SELECT coin_id, COUNT(*) AS veces_sin_actualizar, MAX(snapshot_ts) AS ultima_vez
 FROM coin_market_snapshots_not_updated
 GROUP BY coin_id
