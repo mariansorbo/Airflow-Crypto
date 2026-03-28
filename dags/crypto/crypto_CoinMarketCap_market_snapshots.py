@@ -1,15 +1,19 @@
 """
-DAG: crypto_market_snapshots
+DAG: crypto_CoinMarketCap_market_snapshots
 Schedule: None — self-triggering (each run schedules the next one)
-Source: CoinGecko GET /coins/markets (1 API call for all 50 coins)
+Source: CoinMarketCap GET /v1/cryptocurrency/quotes/latest (1 API call for all 50 coins)
 Target: PostgreSQL — coin_market_snapshots, coin_daily_summary, raw.coin_market_responses
 
-Task graph (linear — single API call, no parallel branches needed):
+Fallback pipeline for crypto_market_snapshots. Shares all tasks except extraction:
+the CoinMarketCap API replaces CoinGecko as the data source, but the response is
+normalized to the same field names so validate / transform / load run unchanged.
+
+Task graph (identical structure to crypto_market_snapshots):
 
     get_coin_universe
           │
           ▼
-    extract_current_snapshot      ← GET /coins/markets (1 call, 50 coins)
+    extract_current_snapshot      ← GET /v1/cryptocurrency/quotes/latest (1 call, 50 coins)
           │
           ▼
     load_raw_data                 ← persist raw JSON to raw.coin_market_responses
@@ -25,7 +29,7 @@ Task graph (linear — single API call, no parallel branches needed):
           │
           ▼
     load_to_postgres              ← insert into coin_market_snapshots
-          │                          (trigger handles duplicate origin_updated_time)
+          │
           ▼
     build_daily_summary           ← UPSERT OHLCV into coin_daily_summary
           │
@@ -33,30 +37,13 @@ Task graph (linear — single API call, no parallel branches needed):
     finalize_run                  ← close orchestration.pipeline_runs record
           │
           ▼
-    should_self_trigger           ← ShortCircuit: skips next two tasks if backfill run
-          │
-          ▼
-    wait_for_next_slot            ← sleeps until 30 min have elapsed since snapshot_ts
+    should_self_trigger           ← ShortCircuit: skips next task if backfill run
           │
           ▼
     trigger_next_run              ← TriggerDagRunOperator → fires a new run of this DAG
 
-Note: coins_dim and coin_dev_metrics are updated by crypto_daily_pull_metadata DAG,
-not here. Stub dim rows are auto-inserted if a coin has no metadata yet.
-
-Self-trigger cadence:
-    Each run waits until 30 minutes have elapsed since its own snapshot_ts, then
-    triggers the next run. This means the gap between runs is always >= 30 min,
-    regardless of how long the pipeline itself takes.
-    Backfill runs (run_type == "backfill") skip the wait and do NOT self-trigger,
-    so a backfill chain does not accidentally re-launch normal production runs.
-
-Warning — worker slot usage:
-    The wait_for_next_slot task holds a Celery worker slot for the duration of the
-    sleep (up to ~30 min). This is acceptable for a single-worker setup but wastes
-    resources if the worker pool is shared. The alternative is to keep the cron
-    schedule (*/30 * * * *) and rely on max_active_runs=1 — Airflow handles the
-    pacing without occupying a worker.
+Environment variable required:
+    CMC_API_KEY — CoinMarketCap API key
 """
 
 import logging
@@ -67,18 +54,18 @@ from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from crypto.coins import COIN_UNIVERSE
-from crypto.market_snapshots import extract, validate, transform, load, load_raw, extract_from_raw
+from crypto.market_snapshots import validate, transform, load, load_raw, extract_from_raw
+from crypto.market_snapshots import CoinMarketCap_extract as cmc_extract
 from crypto import pipeline_control
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Failure callback — fires when any task fails
+# Failure callback
 # ---------------------------------------------------------------------------
 
 def _on_failure_callback(context):
-    """Marks the run as failed in orchestration.pipeline_runs."""
     run_id    = context.get("run_id", "unknown")
     task_id   = context["task_instance"].task_id
     exception = context.get("exception", "unknown error")
@@ -90,13 +77,13 @@ def _on_failure_callback(context):
 # ---------------------------------------------------------------------------
 
 with DAG(
-    dag_id="crypto_market_snapshots",
-    description="Captures crypto market snapshots every ~30 min — self-triggering, 1 API call for all 50 coins",
+    dag_id="crypto_CoinMarketCap_market_snapshots",
+    description="Fallback market snapshots via CoinMarketCap — self-triggering, 1 API call for all 50 coins",
     schedule=None,
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
-    tags=["crypto", "coingecko", "market-data"],
+    tags=["crypto", "coinmarketcap", "market-data", "fallback"],
     on_failure_callback=_on_failure_callback,
     default_args={
         "owner": "airflow",
@@ -107,13 +94,13 @@ with DAG(
     # -----------------------------------------------------------------------
     # Task 1 — get_coin_universe
     #
-    # Reads the static list of 50 coin IDs from crypto/coins.py.
-    # Captures the real execution timestamp (datetime.now(UTC)) so all
-    # downstream tasks use the same consistent snapshot_ts.
-    # Registers the run start in orchestration.pipeline_runs.
+    # Reads the static list from crypto/coins.py.
+    # Pushes coin_pairs (full tuples) for the CMC extract task, and
+    # coin_ids (IDs only) for coins_expected count.
     #
     # Output (XCom):
-    #   coin_ids    → List[str]
+    #   coin_pairs  → List[Tuple[str, str]]  — (coingecko_id, symbol)
+    #   coin_ids    → List[str]              — coingecko_ids only
     #   snapshot_ts → str (ISO-8601)
     #   run_type    → str ("scheduled" | "manual" | "backfill")
     # -----------------------------------------------------------------------
@@ -124,13 +111,15 @@ with DAG(
         run_type    = ctx["dag_run"].run_type
         snapshot_ts = datetime.now(UTC).isoformat()
 
-        # Check if backfill_slot was passed via DAG conf (from backfill manager)
         backfill_slot = ctx["dag_run"].conf.get("backfill_slot") if ctx["dag_run"].conf else None
         if backfill_slot:
             snapshot_ts = backfill_slot
             run_type    = "backfill"
 
-        ti.xcom_push(key="coin_ids",    value=[coin_id for coin_id, _ in COIN_UNIVERSE])
+        coin_ids = [cgid for cgid, _ in COIN_UNIVERSE]
+
+        ti.xcom_push(key="coin_pairs",  value=COIN_UNIVERSE)
+        ti.xcom_push(key="coin_ids",    value=coin_ids)
         ti.xcom_push(key="snapshot_ts", value=snapshot_ts)
         ti.xcom_push(key="run_type",    value=run_type)
 
@@ -150,33 +139,25 @@ with DAG(
     # -----------------------------------------------------------------------
     # Task 2 — extract_current_snapshot
     #
-    # Single GET /coins/markets call returning price, market cap, volume,
-    # supply, rank, and last_updated for all 50 coins.
+    # Single GET /v1/cryptocurrency/quotes/latest call via CoinMarketCap.
+    # Response is normalized to CoinGecko-compatible field names before
+    # being pushed to XCom so all downstream tasks run unchanged.
     #
-    # Input:  coin_ids (XCom)
-    # Output: market_data → Dict[coin_id, dict]
+    # Input:  coin_pairs (XCom)
+    # Output: market_data → Dict[coingecko_id, normalized_dict]
     # -----------------------------------------------------------------------
     def _extract_current_snapshot(**ctx):
-        ti       = ctx["ti"]
-        coin_ids = ti.xcom_pull(task_ids="get_coin_universe", key="coin_ids")
+        ti         = ctx["ti"]
+        coin_pairs = ti.xcom_pull(task_ids="get_coin_universe", key="coin_pairs")
 
-        market_data = extract.fetch_market_snapshot(coin_ids)
+        market_data = cmc_extract.fetch_market_snapshot(coin_pairs)
         ti.xcom_push(key="market_data", value=market_data)
 
-        log.info("Market snapshot fetched for %d coins", len(market_data))
+        log.info("CMC market snapshot fetched for %d coins", len(market_data))
         return f"Fetched market data: {len(market_data)} coins"
 
     # -----------------------------------------------------------------------
     # Task 3 — load_raw_data
-    #
-    # Persists the raw /coins/markets payload into raw.coin_market_responses
-    # before any validation or transformation occurs.
-    # Guarantees the original API response is always stored, even if
-    # downstream tasks fail.
-    #
-    # Input:  market_data (XCom)
-    # Output: run_id, snapshot_ts, run_type (XCom)
-    # Tables: raw.coin_market_responses (50 rows, 1 per coin)
     # -----------------------------------------------------------------------
     def _load_raw_data(**ctx):
         ti              = ctx["ti"]
@@ -203,15 +184,6 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 4 — extract_from_raw
-    #
-    # Reads the just-saved batch back from raw.coin_market_responses.
-    # From this point forward the pipeline works exclusively with data
-    # retrieved from the DB, not from XComs of the extract task.
-    # This decoupling allows backfill runs to inject historical data
-    # through the same pipeline without changing any downstream logic.
-    #
-    # Input:  run_id (XCom from load_raw_data)
-    # Output: market_data → Dict[coin_id, dict], run_id (XCom)
     # -----------------------------------------------------------------------
     def _extract_from_raw(**ctx):
         ti     = ctx["ti"]
@@ -231,16 +203,6 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 5 — validate_raw_data
-    #
-    # Applies business rules to the raw market data:
-    #   - coin_id present and non-empty
-    #   - current_price > 0
-    #   - market_cap >= 0
-    # Coins that fail are discarded with a WARNING log. The pipeline
-    # continues with the valid subset — no exception is raised.
-    #
-    # Input:  market_data (XCom from extract_from_raw)
-    # Output: valid_market → Dict[coin_id, dict], coins_processed → int
     # -----------------------------------------------------------------------
     def _validate_raw_data(**ctx):
         ti          = ctx["ti"]
@@ -260,19 +222,11 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 6 — transform_and_normalize
-    #
-    # Converts validated raw dicts into typed rows for coin_market_snapshots.
-    # Each row includes: snapshot_ts, coin_id, price, market_cap, volume,
-    # supply fields, rank, run_type, and origin_updated_time (CoinGecko's
-    # last_updated timestamp, used by the dedup trigger).
-    #
-    # Input:  valid_market (XCom), snapshot_ts, run_type
-    # Output: snapshots → List[dict]
     # -----------------------------------------------------------------------
     def _transform_and_normalize(**ctx):
-        ti          = ctx["ti"]
-        snapshot_ts = ti.xcom_pull(task_ids="get_coin_universe", key="snapshot_ts")
-        run_type    = ti.xcom_pull(task_ids="get_coin_universe", key="run_type")
+        ti           = ctx["ti"]
+        snapshot_ts  = ti.xcom_pull(task_ids="get_coin_universe", key="snapshot_ts")
+        run_type     = ti.xcom_pull(task_ids="get_coin_universe", key="run_type")
         valid_market = ti.xcom_pull(task_ids="validate_raw_data", key="valid_market")
 
         snapshots = transform.build_snapshots(valid_market, snapshot_ts, run_type)
@@ -285,19 +239,6 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 7 — load_to_postgres
-    #
-    # Writes snapshot rows into coin_market_snapshots.
-    # Before inserting snapshots, auto-inserts minimal stub rows in coins_dim
-    # for any coin that doesn't have metadata yet (avoids FK violations until
-    # the daily pull DAG runs for the first time).
-    #
-    # The trigger trg_check_origin_updated_time intercepts each row:
-    #   - If origin_updated_time > last recorded → insert proceeds normally
-    #   - If not newer → insert is cancelled, row goes to
-    #     coin_market_snapshots_not_updated instead
-    #
-    # Input:  snapshots (XCom)
-    # Output: clean_rows_inserted, raw_rows_inserted (XCom for finalize_run)
     # -----------------------------------------------------------------------
     def _load_to_postgres(**ctx):
         ti        = ctx["ti"]
@@ -314,13 +255,6 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 8 — build_daily_summary
-    #
-    # Runs a CTE over coin_market_snapshots to compute OHLCV aggregates
-    # for today and upserts them into coin_daily_summary. Idempotent:
-    # can be re-run as many times as needed throughout the day.
-    #
-    # Input:  snapshot_ts (XCom — determines which date to aggregate)
-    # Tables: coin_daily_summary (UPSERT)
     # -----------------------------------------------------------------------
     def _build_daily_summary(**ctx):
         ti          = ctx["ti"]
@@ -331,19 +265,13 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 9 — finalize_run
-    #
-    # Closes the orchestration.pipeline_runs record with final counts and
-    # status: 'success' if all 50 coins processed, 'partial' if fewer.
-    #
-    # Input:  coins_processed, clean_rows_inserted, raw_rows_inserted (XCom)
-    # Tables: orchestration.pipeline_runs (UPDATE)
     # -----------------------------------------------------------------------
     def _finalize_run(**ctx):
         ti                  = ctx["ti"]
         run_id              = ctx["run_id"]
-        coins_processed     = ti.xcom_pull(task_ids="validate_raw_data",      key="coins_processed")
-        clean_rows_inserted = ti.xcom_pull(task_ids="load_to_postgres",       key="clean_rows_inserted")
-        raw_rows_inserted   = ti.xcom_pull(task_ids="load_to_postgres",       key="raw_rows_inserted")
+        coins_processed     = ti.xcom_pull(task_ids="validate_raw_data", key="coins_processed")
+        clean_rows_inserted = ti.xcom_pull(task_ids="load_to_postgres",  key="clean_rows_inserted")
+        raw_rows_inserted   = ti.xcom_pull(task_ids="load_to_postgres",  key="raw_rows_inserted")
 
         pipeline_control.finish_run(
             conn_id             = "crypto_postgres",
@@ -358,10 +286,6 @@ with DAG(
 
     # -----------------------------------------------------------------------
     # Task 10 — should_self_trigger
-    #
-    # ShortCircuit: returns True only for non-backfill runs.
-    # If this is a backfill run, the downstream trigger task is skipped so
-    # the backfill chain doesn't re-launch normal production runs.
     # -----------------------------------------------------------------------
     def _should_self_trigger(**ctx):
         run_type = ctx["ti"].xcom_pull(task_ids="get_coin_universe", key="run_type")
@@ -389,13 +313,10 @@ with DAG(
     )
     t_trigger = TriggerDagRunOperator(
         task_id="trigger_next_run",
-        trigger_dag_id="crypto_market_snapshots",
-        wait_for_completion=False,   # fire-and-forget — don't block the current run
+        trigger_dag_id="crypto_CoinMarketCap_market_snapshots",
+        wait_for_completion=False,
     )
 
-    # -----------------------------------------------------------------------
-    # Task dependencies — fully linear (single API call, no parallel branches)
-    # -----------------------------------------------------------------------
     (
         t_universe
         >> t_snapshot
