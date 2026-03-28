@@ -18,6 +18,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     AIRFLOW_CONN_CRYPTO_POSTGRES: postgresql://airflow:airflow@postgres:5432/crypto_data
+    COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+    CMC_API_KEY: ${CMC_API_KEY:-}
   volumes:
     - git-dags:/opt/airflow/git            # DAGs served by git-sync
     - ./logs:/opt/airflow/logs
